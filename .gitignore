@@ -1,0 +1,11 @@
+.env
+downloads/*
+!downloads/.gitkeep
+logs/*
+!logs/debug/
+logs/debug/*
+!logs/debug/.gitkeep
+__pycache__/
+*.pyc
+*.zip
+venv/
