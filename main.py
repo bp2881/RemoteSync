@@ -1,13 +1,13 @@
 """
-main_sync.py — RemoteSync folder-sync entry point.
+main.py — RemoteSync folder-sync entry point.
 
 Workflow
 --------
-1. Selenium login (HMAC-MD5 challenge-response, same as main.py)
-2. Navigate to folder_view.php → extract tok + cookies from JS runtime
+1. Selenium login (HMAC-MD5 challenge-response)
+2. Navigate to folder_view.php -> extract tok + cookies from JS runtime
 3. Close browser (Selenium no longer needed)
 4. Use RemoteSyncAPIClient (pure HTTP) to walk the remote folder tree
-5. FolderSyncEngine downloads new / updated files to the local sync dir
+5. FolderSyncEngine uploads/downloads based on direction
 
 Configuration (via .env)
 ------------------------
@@ -15,9 +15,10 @@ Configuration (via .env)
   REMOTE_SYNC_USERNAME             Login username
   REMOTE_SYNC_PASSWORD             Login password
   REMOTE_SYNC_VOLUME_ID            USB volume ID  (e.g. SanDisk_SANDISK_72541)
-  REMOTE_SYNC_SYNC_REMOTE_PATH     Remote folder to sync  (e.g. /SanDisk_SANDISK_72541/Pranav)
-  REMOTE_SYNC_SYNC_LOCAL_PATH      Local destination directory
-  REMOTE_SYNC_SYNC_DRY_RUN         Set to "true" to log without downloading
+  REMOTE_SYNC_SYNC_REMOTE_PATH     Remote folder to sync  (e.g. /SanDisk_SANDISK_72541/Resume)
+  REMOTE_SYNC_SYNC_LOCAL_PATH      Local source/destination directory
+  REMOTE_SYNC_SYNC_DIRECTION       pull | push | two_way  (default: two_way)
+  REMOTE_SYNC_SYNC_DRY_RUN         Set to "true" to log without transferring
 """
 
 import logging
@@ -68,13 +69,13 @@ def main() -> None:
         "REMOTE_SYNC_SYNC_LOCAL_PATH",
         str(Path("sync") / (remote_path.strip("/").replace("/", "_") or "remote_sync")),
     )
-    direction   = os.environ.get("REMOTE_SYNC_SYNC_DIRECTION", "pull").lower()
+    direction   = os.environ.get("REMOTE_SYNC_SYNC_DIRECTION", "two_way").lower()
     dry_run     = os.environ.get("REMOTE_SYNC_SYNC_DRY_RUN", "").lower() in ("1", "true", "yes")
 
     if not remote_path:
         logger.error(
             "REMOTE_SYNC_SYNC_REMOTE_PATH is not set. "
-            "Set it in .env, e.g.  REMOTE_SYNC_SYNC_REMOTE_PATH=/SanDisk_SANDISK_72541/Pranav"
+            "Set it in .env, e.g.  REMOTE_SYNC_SYNC_REMOTE_PATH=/SanDisk_SANDISK_72541/Resume"
         )
         sys.exit(1)
 
@@ -91,7 +92,7 @@ def main() -> None:
         username=username,
         password=password,
         download_dir="downloads",
-        headless=True,   # headless for sync — no window needed
+        headless=True,
     )
 
     try:
@@ -101,7 +102,7 @@ def main() -> None:
     finally:
         client.close()
 
-    # Prefer env-configured volid; fall back to what JS reported.
+    # Prefer env-configured volid; fall back to what JS reported
     if volume_id:
         volid = volume_id
 
@@ -120,12 +121,28 @@ def main() -> None:
         cookies=cookies,
     )
 
-    # Quick connectivity check: list volumes
+    # ------------------------------------------------------------------
+    # Diagnostics - helps debug listing / volid issues
+    # ------------------------------------------------------------------
     try:
         vols = api.list_volumes()
-        logger.info("Volumes on device: %s", [v.get("volid") for v in vols])
+        logger.info("Volumes on device: %s", vols)
     except Exception as exc:
-        logger.warning("Could not list volumes (continuing anyway): %s", exc)
+        logger.warning("Could not list volumes: %s", exc)
+
+    try:
+        root_files = api.list_directory(f"/{volid}")
+        logger.info("Root listing for /%s: %s", volid, [(f.name, f.size, f.mtime) for f in root_files])
+    except Exception as exc:
+        logger.warning("Could not list root directory: %s", exc)
+
+    try:
+        resume_files = api.list_directory(remote_path)
+        logger.info("Listing for %s (%d entries):", remote_path, len(resume_files))
+        for f in resume_files:
+            logger.info("  %s  size=%s  mtime=%s", f.name, f.size, f.mtime)
+    except Exception as exc:
+        logger.warning("Could not list remote_path %s: %s", remote_path, exc)
 
     # ------------------------------------------------------------------
     # Step 3: Sync

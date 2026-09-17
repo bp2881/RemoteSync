@@ -5,7 +5,9 @@ A clean, consolidated API for D-Link DIR-850L RemoteSync Web File Access.
 
 from __future__ import annotations
 
+import json
 import logging
+import mimetypes
 import random
 import time
 import os
@@ -73,8 +75,7 @@ class RemoteSyncAPIClient:
         self._session = requests.Session()
         for k, v in cookies.items():
             self._session.cookies.set(k, v)
-        
-        # Ensure correct Accept header as seen in browser
+
         self._session.headers.update({
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
         })
@@ -89,7 +90,7 @@ class RemoteSyncAPIClient:
             f"&volid={self.volid}&path={encoded_path}&random={random.random()}"
         )
         data = self._api_json(url)
-        
+
         results = []
         for obj in data.get("files", []):
             is_dir = bool(obj.get("type") == "folder")
@@ -106,7 +107,6 @@ class RemoteSyncAPIClient:
     def _walk(self, current_path: str, depth: int, max_depth: int) -> Generator[RemoteFile, None, None]:
         if depth > max_depth:
             return
-        
         items = self.list_directory(current_path)
         for item in items:
             yield item
@@ -156,8 +156,10 @@ class RemoteSyncAPIClient:
             "path": path + "/",
             "filename": filename,
         }
+        mime_type, _ = mimetypes.guess_type(filename)
+        mime_type = mime_type or "application/octet-stream"
         with local_file.open("rb") as f:
-            files = {"file": (filename, f, "application/octet-stream")}
+            files = {"file": (filename, f, mime_type)}
             resp = self._session.post(url, data=data, files=files, timeout=self.timeout)
             resp.raise_for_status()
 
@@ -169,6 +171,58 @@ class RemoteSyncAPIClient:
             return resp.json()
         except ValueError:
             return {}
+
+
+# ======================================================================
+# State file — tracks what has been successfully uploaded
+# since the router listing API is broken and returns empty.
+#
+# Stored at: <local_root>/.remotesync_state.json
+# Format:
+#   { "remote/path/file.pdf": { "size": 12345, "mtime": 1700000000 }, ... }
+#
+# A file is considered synced if its local size AND mtime match the
+# recorded values. If the file changes locally it will be re-uploaded.
+# ======================================================================
+
+class SyncStateStore:
+    def __init__(self, local_root: Path) -> None:
+        self._path = local_root / ".remotesync_state.json"
+        self._data: dict[str, dict] = {}
+        self._load()
+
+    def _load(self) -> None:
+        if self._path.exists():
+            try:
+                self._data = json.loads(self._path.read_text())
+            except Exception:
+                self._data = {}
+
+    def _save(self) -> None:
+        self._path.write_text(json.dumps(self._data, indent=2))
+
+    def is_synced(self, remote_path: str, local_file: Path) -> bool:
+        """Return True if this file was already uploaded and hasn't changed."""
+        record = self._data.get(remote_path)
+        if not record:
+            return False
+        stat = local_file.stat()
+        return (
+            record.get("size") == stat.st_size
+            and record.get("mtime") == int(stat.st_mtime)
+        )
+
+    def mark_synced(self, remote_path: str, local_file: Path) -> None:
+        stat = local_file.stat()
+        self._data[remote_path] = {
+            "size": stat.st_size,
+            "mtime": int(stat.st_mtime),
+        }
+        self._save()
+
+    def remove(self, remote_path: str) -> None:
+        self._data.pop(remote_path, None)
+        self._save()
 
 
 # ======================================================================
@@ -200,7 +254,7 @@ class FolderSyncEngine:
         remote_root: str,
         local_root: Path,
         *,
-        direction: str = "pull",
+        direction: str = "two_way",
         dry_run: bool = False,
     ) -> None:
         self.api = api
@@ -214,6 +268,8 @@ class FolderSyncEngine:
 
         if not dry_run:
             self.local_root.mkdir(parents=True, exist_ok=True)
+
+        self._state = SyncStateStore(self.local_root)
 
     def _local_path(self, remote_path: str) -> Path:
         rel = remote_path
@@ -231,22 +287,27 @@ class FolderSyncEngine:
             self.remote_root, self.local_root, self.direction, self.dry_run,
         )
 
+        # Remote tree - may be empty if router listing is broken
         remote_tree: dict[str, RemoteFile] = {}
         logger.info("Scanning remote directory tree...")
         for entry in self.api.iter_all_files(self.remote_root):
             remote_tree[entry.path] = entry
 
+        # Local tree
         local_tree: dict[str, Path] = {}
         logger.info("Scanning local directory tree...")
         if self.local_root.exists():
             for p in self.local_root.rglob("*"):
+                # Skip Word/Office lock files and the state file itself
+                if p.name.startswith("~$") or p.name == ".remotesync_state.json":
+                    continue
                 rel = p.relative_to(self.local_root)
                 equiv_remote_path = f"{self.remote_root}/{rel.as_posix()}"
                 local_tree[equiv_remote_path] = p
 
         actions: list[tuple[str, str, Optional[RemoteFile], Optional[Path]]] = []
         all_paths = set(remote_tree.keys()) | set(local_tree.keys())
-        
+
         for path in sorted(all_paths):
             remote_entry = remote_tree.get(path)
             local_entry = local_tree.get(path)
@@ -256,29 +317,41 @@ class FolderSyncEngine:
                 is_dir = True
             elif local_entry and local_entry.is_dir():
                 is_dir = True
-                
+
             if is_dir:
                 if not local_entry and self.direction in ("pull", "two_way"):
                     actions.append(("MKDIR_LOCAL", path, remote_entry, None))
                 if not remote_entry and self.direction in ("push", "two_way"):
                     actions.append(("MKDIR_REMOTE", path, None, local_entry))
                 continue
-                
+
             if remote_entry and not local_entry:
                 if self.direction in ("pull", "two_way"):
                     actions.append(("DOWNLOAD", path, remote_entry, self._local_path(path)))
+
             elif local_entry and not remote_entry:
                 if self.direction in ("push", "two_way"):
-                    actions.append(("UPLOAD", path, None, local_entry))
+                    # Check local state file before uploading
+                    if self._state.is_synced(path, local_entry):
+                        logger.debug("SKIP (state) %s", path)
+                        stats.skipped += 1
+                    else:
+                        actions.append(("UPLOAD", path, None, local_entry))
+
             elif remote_entry and local_entry:
-                local_mtime = int(local_entry.stat().st_mtime)
-                remote_mtime = remote_entry.mtime
-                if remote_mtime > local_mtime + 2 and self.direction in ("pull", "two_way"):
-                    actions.append(("DOWNLOAD", path, remote_entry, local_entry))
-                elif local_mtime > remote_mtime + 2 and self.direction in ("push", "two_way"):
-                    actions.append(("UPLOAD", path, remote_entry, local_entry))
-                else:
+                # Both exist - router mtime/size are unreliable, fall back to state file
+                if self._state.is_synced(path, local_entry):
+                    logger.debug("SKIP (state) %s", path)
                     stats.skipped += 1
+                else:
+                    local_mtime = int(local_entry.stat().st_mtime)
+                    remote_mtime = remote_entry.mtime or 0
+                    if remote_mtime > local_mtime + 2 and self.direction in ("pull", "two_way"):
+                        actions.append(("DOWNLOAD", path, remote_entry, local_entry))
+                    elif self.direction in ("push", "two_way"):
+                        actions.append(("UPLOAD", path, remote_entry, local_entry))
+                    else:
+                        stats.skipped += 1
 
         for action, path, remote_entry, local_entry in actions:
             if action == "MKDIR_LOCAL":
@@ -286,7 +359,7 @@ class FolderSyncEngine:
                 if not self.dry_run:
                     dest.mkdir(parents=True, exist_ok=True)
                     stats.dirs_created += 1
-            
+
             elif action == "MKDIR_REMOTE":
                 parent_path = path[:path.rfind("/")]
                 dirname = path[path.rfind("/")+1:]
@@ -310,6 +383,7 @@ class FolderSyncEngine:
                         )
                         if remote_entry.mtime:
                             os.utime(local_entry, (remote_entry.mtime, remote_entry.mtime))
+                        self._state.mark_synced(path, local_entry)
                         stats.downloaded += 1
                         stats.bytes_transferred += local_entry.stat().st_size
                     except Exception as exc:
@@ -323,17 +397,29 @@ class FolderSyncEngine:
                 if not self.dry_run:
                     folder_path = path[:path.rfind("/")]
                     filename = path[path.rfind("/")+1:]
-                    try:
-                        self.api.upload_file(
-                            path=folder_path,
-                            filename=filename,
-                            local_file=local_entry,
-                        )
-                        stats.uploaded += 1
-                        stats.bytes_transferred += local_entry.stat().st_size
-                    except Exception as exc:
-                        logger.error("FAIL UPLOAD %s: %s", path, exc)
-                        stats.failed += 1
+                    time.sleep(0.5)  # give the router time to breathe
+                    for attempt in range(3):
+                        try:
+                            self.api.upload_file(
+                                path=folder_path,
+                                filename=filename,
+                                local_file=local_entry,
+                            )
+                            self._state.mark_synced(path, local_entry)
+                            stats.uploaded += 1
+                            stats.bytes_transferred += local_entry.stat().st_size
+                            break
+                        except Exception as exc:
+                            if attempt < 2:
+                                wait = 2 ** attempt  # 1s, then 2s
+                                logger.warning(
+                                    "RETRY %d/3 UPLOAD %s: %s (retrying in %ds)",
+                                    attempt + 1, path, exc, wait,
+                                )
+                                time.sleep(wait)
+                            else:
+                                logger.error("FAIL UPLOAD %s: %s", path, exc)
+                                stats.failed += 1
                 else:
                     stats.uploaded += 1
 
@@ -363,7 +449,7 @@ class RemoteSyncClient:
             options.add_argument("--headless=new")
         options.add_argument("--window-size=1400,1000")
         options.add_argument("--disable-notifications")
-        
+
         try:
             self.driver = webdriver.Chrome(options=options)
         except WebDriverException as exc:
@@ -403,7 +489,7 @@ class RemoteSyncClient:
         username_field.send_keys(self._username)
         password_field.clear()
         password_field.send_keys(self._password)
-        
+
         login_url = self.driver.current_url
         submit_button.click()
 
@@ -416,7 +502,7 @@ class RemoteSyncClient:
             self._logged_in = True
             logger.info("Login successful (redirected to %s)", self.driver.current_url)
             return
-            
+
         raise RemoteSyncLoginError("Login failed: URL did not change.")
 
     def get_api_session(self) -> tuple[str, str, str, dict]:

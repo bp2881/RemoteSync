@@ -8,4 +8,4 @@ logs/debug/*
 __pycache__/
 *.pyc
 *.zip
-venv/
+.venv/
